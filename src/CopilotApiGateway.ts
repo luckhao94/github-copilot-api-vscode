@@ -119,7 +119,7 @@ export interface AnthropicMessageResponse {
 
 // --- Google Generative AI Interfaces ---
 export interface GoogleGenerateContentRequest {
-	contents: { role?: string; parts: { text: string }[] }[];
+	contents: { role?: string; parts: { text?: string; inline_data?: { mime_type: string; data: string } }[] }[];
 	systemInstruction?: { parts: { text: string }[] };
 	generationConfig?: {
 		stopSequences?: string[];
@@ -579,6 +579,91 @@ export class CopilotApiGateway implements vscode.Disposable {
 		};
 
 		return redactObject(data) as T;
+	}
+
+	/**
+	 * Convert OpenAI-format multimodal content array to VS Code LanguageModel message parts.
+	 * Handles text, image_url (data: URI with base64), and falls back to text for unsupported types.
+	 */
+	private convertContentPartsToLmParts(content: any[]): Array<vscode.LanguageModelTextPart | vscode.LanguageModelDataPart> {
+		const parts: Array<vscode.LanguageModelTextPart | vscode.LanguageModelDataPart> = [];
+		for (const part of content) {
+			if (typeof part === 'string') {
+				parts.push(new vscode.LanguageModelTextPart(part));
+			} else if (part && typeof part === 'object') {
+				if (part.type === 'text' && typeof part.text === 'string') {
+					parts.push(new vscode.LanguageModelTextPart(part.text));
+				} else if (part.type === 'image_url' && part.image_url?.url) {
+					const url: string = part.image_url.url;
+					const dataMatch = url.match(/^data:([^;]+);base64,(.+)$/s);
+					if (dataMatch) {
+						const mimeType = dataMatch[1];
+						const base64Data = dataMatch[2];
+						try {
+							const buffer = Buffer.from(base64Data, 'base64');
+							parts.push(vscode.LanguageModelDataPart.image(buffer, mimeType));
+						} catch {
+							parts.push(new vscode.LanguageModelTextPart(`[Image: ${mimeType}, decode error]`));
+						}
+					} else {
+						// External URL — not supported by VS Code LM API, pass as text reference
+						parts.push(new vscode.LanguageModelTextPart(`[Image URL: ${url}]`));
+					}
+				} else if (part.type === 'image' && part.source?.type === 'base64' && part.source?.data) {
+					// Anthropic format: { type: "image", source: { type: "base64", media_type, data } }
+					const mimeType = part.source.media_type || 'image/png';
+					try {
+						const buffer = Buffer.from(part.source.data, 'base64');
+						parts.push(vscode.LanguageModelDataPart.image(buffer, mimeType));
+					} catch {
+						parts.push(new vscode.LanguageModelTextPart(`[Image: ${mimeType}, decode error]`));
+					}
+				} else {
+					// Unknown part type, stringify as fallback
+					parts.push(new vscode.LanguageModelTextPart(JSON.stringify(part)));
+				}
+			}
+		}
+		return parts;
+	}
+
+	/**
+	 * Convert Google/Gemini format parts (with inline_data) to VS Code LanguageModel message parts.
+	 */
+	private convertGooglePartsToLmParts(parts: any[]): Array<vscode.LanguageModelTextPart | vscode.LanguageModelDataPart> {
+		const lmParts: Array<vscode.LanguageModelTextPart | vscode.LanguageModelDataPart> = [];
+		for (const p of parts) {
+			if (p.text !== undefined) {
+				lmParts.push(new vscode.LanguageModelTextPart(p.text));
+			} else if (p.inline_data && p.inline_data.data) {
+				const mimeType = p.inline_data.mime_type || 'image/png';
+				try {
+					const buffer = Buffer.from(p.inline_data.data, 'base64');
+					lmParts.push(vscode.LanguageModelDataPart.image(buffer, mimeType));
+				} catch {
+					lmParts.push(new vscode.LanguageModelTextPart(`[Image: ${mimeType}, decode error]`));
+				}
+			}
+		}
+		return lmParts;
+	}
+
+	/**
+	 * Build a VS Code LanguageModelChatMessage for a user/system message, supporting multimodal content.
+	 * If content is an array with image parts, creates a multimodal message; otherwise creates a text-only message.
+	 */
+	private buildLmUserMessage(content: unknown, prefix?: string): vscode.LanguageModelChatMessage {
+		if (Array.isArray(content) && content.some((p: any) => p?.type === 'image_url' || p?.type === 'image')) {
+			// Multimodal: convert all parts
+			const parts = this.convertContentPartsToLmParts(content);
+			if (prefix) {
+				parts.unshift(new vscode.LanguageModelTextPart(prefix));
+			}
+			return vscode.LanguageModelChatMessage.User(parts);
+		}
+		// Text-only fallback
+		const text = typeof content === 'string' ? content : JSON.stringify(content);
+		return vscode.LanguageModelChatMessage.User(prefix ? `${prefix}${text}` : text);
 	}
 
 	/**
@@ -1909,13 +1994,28 @@ export class CopilotApiGateway implements vscode.Disposable {
 
 		for (const content of payload.contents) {
 			const role = content.role === 'model' ? vscode.LanguageModelChatMessageRole.Assistant : vscode.LanguageModelChatMessageRole.User;
-			const text = content.parts.map(p => p.text).join(' ');
-			const redactedText = this.redactPromptString(text);
+			// Check if any part has inline_data (image)
+			const hasImageData = content.parts.some((p: any) => p.inline_data);
 
-			if (role === vscode.LanguageModelChatMessageRole.User) {
-				messages.push(vscode.LanguageModelChatMessage.User(redactedText));
+			if (hasImageData && role === vscode.LanguageModelChatMessageRole.User) {
+				// Multimodal message with images
+				const lmParts = this.convertGooglePartsToLmParts(content.parts);
+				// Apply redaction to text parts only
+				const redactedParts = lmParts.map(p => {
+					if (p instanceof vscode.LanguageModelTextPart) {
+						return new vscode.LanguageModelTextPart(this.redactPromptString(p.value));
+					}
+					return p;
+				});
+				messages.push(vscode.LanguageModelChatMessage.User(redactedParts));
 			} else {
-				messages.push(vscode.LanguageModelChatMessage.Assistant(redactedText));
+				const text = content.parts.map((p: any) => p.text || '').join(' ');
+				const redactedText = this.redactPromptString(text);
+				if (role === vscode.LanguageModelChatMessageRole.User) {
+					messages.push(vscode.LanguageModelChatMessage.User(redactedText));
+				} else {
+					messages.push(vscode.LanguageModelChatMessage.Assistant(redactedText));
+				}
 			}
 		}
 
@@ -2031,13 +2131,25 @@ export class CopilotApiGateway implements vscode.Disposable {
 
 		for (const msg of payload.messages) {
 			const role = msg.role === 'user' ? vscode.LanguageModelChatMessageRole.User : vscode.LanguageModelChatMessageRole.Assistant;
-			const content = typeof msg.content === 'string' ? msg.content : msg.content.map(c => c.text).join(' ');
-			const redactedContent = this.redactPromptString(content);
 
-			if (role === vscode.LanguageModelChatMessageRole.User) {
-				messages.push(vscode.LanguageModelChatMessage.User(redactedContent));
+			if (role === vscode.LanguageModelChatMessageRole.User && Array.isArray(msg.content) &&
+				msg.content.some((c: any) => c.type === 'image')) {
+				const parts = this.convertContentPartsToLmParts(msg.content);
+				const redactedParts = parts.map(p => {
+					if (p instanceof vscode.LanguageModelTextPart) {
+						return new vscode.LanguageModelTextPart(this.redactPromptString(p.value));
+					}
+					return p;
+				});
+				messages.push(vscode.LanguageModelChatMessage.User(redactedParts));
 			} else {
-				messages.push(vscode.LanguageModelChatMessage.Assistant(redactedContent));
+				const content = typeof msg.content === 'string' ? msg.content : msg.content.map((c: any) => c.text || '').join(' ');
+				const redactedContent = this.redactPromptString(content);
+				if (role === vscode.LanguageModelChatMessageRole.User) {
+					messages.push(vscode.LanguageModelChatMessage.User(redactedContent));
+				} else {
+					messages.push(vscode.LanguageModelChatMessage.Assistant(redactedContent));
+				}
 			}
 		}
 
@@ -2225,36 +2337,36 @@ export class CopilotApiGateway implements vscode.Disposable {
 				throw new ApiError(404, `Model "${model}" not found. Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
 			}
 
-			// Convert messages to VS Code format
+			// Convert messages to VS Code format (with multimodal support)
 			const lmMessages: vscode.LanguageModelChatMessage[] = [];
 			for (const msg of messages) {
-				const content = typeof msg.content === 'string'
-					? msg.content
-					: JSON.stringify(msg.content);
-
 				switch (msg.role) {
 					case 'system':
-						lmMessages.push(vscode.LanguageModelChatMessage.User(`[System]: ${content}`));
+						lmMessages.push(this.buildLmUserMessage(msg.content, '[System]: '));
 						break;
 					case 'user':
-						lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+						lmMessages.push(this.buildLmUserMessage(msg.content));
 						break;
-					case 'assistant':
+					case 'assistant': {
+						const assistantText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
 						if (msg.tool_calls && msg.tool_calls.length > 0) {
 							const toolCallInfo = msg.tool_calls.map((tc: any) =>
 								`[Called function: ${tc.function?.name || tc.name}(${tc.function?.arguments || JSON.stringify(tc.arguments)})]`
 							).join('\n');
 							lmMessages.push(vscode.LanguageModelChatMessage.Assistant(toolCallInfo));
 						} else {
-							lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content));
+							lmMessages.push(vscode.LanguageModelChatMessage.Assistant(assistantText));
 						}
 						break;
-					case 'tool':
-						const toolResultContent = `[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content}`;
+					}
+					case 'tool': {
+						const toolText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+						const toolResultContent = `[Tool result for ${msg.tool_call_id || 'unknown'}]: ${toolText}`;
 						lmMessages.push(vscode.LanguageModelChatMessage.User(toolResultContent));
 						break;
+					}
 					default:
-						lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+						lmMessages.push(this.buildLmUserMessage(msg.content));
 				}
 			}
 
@@ -2870,13 +2982,25 @@ export class CopilotApiGateway implements vscode.Disposable {
 
 		for (const msg of payload.messages) {
 			const role = msg.role === 'user' ? vscode.LanguageModelChatMessageRole.User : vscode.LanguageModelChatMessageRole.Assistant;
-			const content = typeof msg.content === 'string' ? msg.content : msg.content.map(c => c.text).join(' ');
-			const redactedContent = this.redactPromptString(content);
 
-			if (role === vscode.LanguageModelChatMessageRole.User) {
-				messages.push(vscode.LanguageModelChatMessage.User(redactedContent));
+			if (role === vscode.LanguageModelChatMessageRole.User && Array.isArray(msg.content) &&
+				msg.content.some((c: any) => c.type === 'image')) {
+				const parts = this.convertContentPartsToLmParts(msg.content);
+				const redactedParts = parts.map(p => {
+					if (p instanceof vscode.LanguageModelTextPart) {
+						return new vscode.LanguageModelTextPart(this.redactPromptString(p.value));
+					}
+					return p;
+				});
+				messages.push(vscode.LanguageModelChatMessage.User(redactedParts));
 			} else {
-				messages.push(vscode.LanguageModelChatMessage.Assistant(redactedContent));
+				const content = typeof msg.content === 'string' ? msg.content : msg.content.map((c: any) => c.text || '').join(' ');
+				const redactedContent = this.redactPromptString(content);
+				if (role === vscode.LanguageModelChatMessageRole.User) {
+					messages.push(vscode.LanguageModelChatMessage.User(redactedContent));
+				} else {
+					messages.push(vscode.LanguageModelChatMessage.Assistant(redactedContent));
+				}
 			}
 		}
 
@@ -2956,13 +3080,27 @@ export class CopilotApiGateway implements vscode.Disposable {
 
 		for (const content of payload.contents) {
 			const role = content.role === 'model' ? vscode.LanguageModelChatMessageRole.Assistant : vscode.LanguageModelChatMessageRole.User;
-			const text = content.parts.map(p => p.text).join(' ');
-			const redactedText = this.redactPromptString(text);
+			// Check if any part has inline_data (image)
+			const hasImageData = content.parts.some((p: any) => p.inline_data);
 
-			if (role === vscode.LanguageModelChatMessageRole.User) {
-				messages.push(vscode.LanguageModelChatMessage.User(redactedText));
+			if (hasImageData && role === vscode.LanguageModelChatMessageRole.User) {
+				// Multimodal message with images
+				const lmParts = this.convertGooglePartsToLmParts(content.parts);
+				const redactedParts = lmParts.map(p => {
+					if (p instanceof vscode.LanguageModelTextPart) {
+						return new vscode.LanguageModelTextPart(this.redactPromptString(p.value));
+					}
+					return p;
+				});
+				messages.push(vscode.LanguageModelChatMessage.User(redactedParts));
 			} else {
-				messages.push(vscode.LanguageModelChatMessage.Assistant(redactedText));
+				const text = content.parts.map((p: any) => p.text || '').join(' ');
+				const redactedText = this.redactPromptString(text);
+				if (role === vscode.LanguageModelChatMessageRole.User) {
+					messages.push(vscode.LanguageModelChatMessage.User(redactedText));
+				} else {
+					messages.push(vscode.LanguageModelChatMessage.Assistant(redactedText));
+				}
 			}
 		}
 
@@ -3277,22 +3415,19 @@ export class CopilotApiGateway implements vscode.Disposable {
 			model = copilotModels[0];
 		}
 
-		// Convert messages to VS Code format
+		// Convert messages to VS Code format (with multimodal support)
 		const lmMessages: vscode.LanguageModelChatMessage[] = [];
 
 		for (const msg of chatMessages) {
-			const content = typeof msg.content === 'string'
-				? msg.content
-				: JSON.stringify(msg.content);
-
 			switch (msg.role) {
 				case 'system':
-					lmMessages.push(vscode.LanguageModelChatMessage.User(`[System]: ${content} `));
+					lmMessages.push(this.buildLmUserMessage(msg.content, '[System]: '));
 					break;
 				case 'user':
-					lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+					lmMessages.push(this.buildLmUserMessage(msg.content));
 					break;
-				case 'assistant':
+				case 'assistant': {
+					const assistantText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
 					if (msg.tool_calls && msg.tool_calls.length > 0) {
 						// Assistant message with tool calls - include tool call info
 						const toolCallInfo = msg.tool_calls.map((tc: any) =>
@@ -3300,16 +3435,19 @@ export class CopilotApiGateway implements vscode.Disposable {
 						).join('\n');
 						lmMessages.push(vscode.LanguageModelChatMessage.Assistant(toolCallInfo));
 					} else {
-						lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content));
+						lmMessages.push(vscode.LanguageModelChatMessage.Assistant(assistantText));
 					}
 					break;
-				case 'tool':
+				}
+				case 'tool': {
 					// Tool result message
-					const toolResultContent = `[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content} `;
+					const toolText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+					const toolResultContent = `[Tool result for ${msg.tool_call_id || 'unknown'}]: ${toolText} `;
 					lmMessages.push(vscode.LanguageModelChatMessage.User(toolResultContent));
 					break;
+				}
 				default:
-					lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+					lmMessages.push(this.buildLmUserMessage(msg.content));
 			}
 		}
 
@@ -5563,7 +5701,7 @@ function getServerConfig(): ApiServerConfig {
 
 	const ipAllowlist = configuration.get<string[]>('server.ipAllowlist', []);
 	const requestTimeoutSeconds = configuration.get<number>('server.requestTimeoutSeconds', 180);
-	const maxPayloadSizeMb = configuration.get<number>('server.maxPayloadSizeMb', 1);
+	const maxPayloadSizeMb = configuration.get<number>('server.maxPayloadSizeMb', 10);
 	const maxConnectionsPerIp = configuration.get<number>('server.maxConnectionsPerIp', 10);
 	const mcpEnabled = vscode.workspace.getConfiguration('githubCopilotApi.mcp').get<boolean>('enabled', true);
 
